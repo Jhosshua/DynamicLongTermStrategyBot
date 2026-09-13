@@ -1,0 +1,29 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Agent metadata & working directories (strictly local, never committed per workspace convention)
+.agents/
+
+# SQLite databases & WAL/SHM artifacts
+*.db
+*.db-wal
+*.db-shm
+
+# Log files & logs directory
+*.log
+logs/
+
+# Python bytecode & cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Operating system artifacts
+.DS_Store
+Thumbs.db
