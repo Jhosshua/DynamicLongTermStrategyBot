@@ -105,6 +105,19 @@ def test_get_health_unauthenticated_200(app_client: TestClient):
     assert data["uptime_s"] >= 0.0
 
 
+def test_head_root_dashboard_html_200(app_client: TestClient):
+    """HEAD / returns HTTP 200 for curl -I health probes."""
+    resp = app_client.head("/")
+    assert resp.status_code == 200
+
+
+def test_head_health_unauthenticated_200(app_client: TestClient):
+    """HEAD /health returns HTTP 200 for curl -I health probes."""
+    resp = app_client.head("/health")
+    assert resp.status_code == 200
+
+
+
 # ==============================================================================
 # 2. Portfolio & Telemetry Endpoints
 # ==============================================================================
