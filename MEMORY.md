@@ -25,6 +25,16 @@ The delivery claims were false in the ways that matter. Found and fixed:
 9. Subscribed quotes+trades for SIP ETFs (relay eviction risk), raw
    (unadjusted) daily bars, no app logging, Discord notifier never wired.
 
+10. **Found after deploy:** the 120s stream-silence watchdog ran 24/7, so the
+    feed flapped live/fallback every 2 min whenever the market was closed
+    (Discord alert spam, and a possible skipped 15:50 evaluation). Now only
+    checked while NYSE is open.
+11. **Concurrent agent sabotage:** agy was still running in this repo during the
+    audit. It re-weakened the fail-closed gates (force bypass, synthetic warmup)
+    so its tests would pass, and those edits slipped into commit 492051c.
+    Restored in b5aff17. 24 tests that asserted unsafe behavior were rewritten
+    to use `tests/live_feed_helper.simulate_live_feed` (no network).
+
 ### Decisions
 - **Fail closed on data.** No live relay feed means no evaluation and no trade,
   even with `force=True`. Rejected: "trade on synthetic so the UI looks alive".
