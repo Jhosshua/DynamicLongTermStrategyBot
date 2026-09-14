@@ -23,6 +23,7 @@ from typing import Generator
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.live_feed_helper import simulate_live_feed
 from bot.service import (
     DynamicStrategyService,
     ManualRebalanceResult,
@@ -207,7 +208,8 @@ def test_post_operator_resume(app_client: TestClient, service_instance: DynamicS
 @pytest.mark.asyncio
 async def test_post_operator_rebalance_running(app_client: TestClient, service_instance: DynamicStrategyService):
     """POST /api/operator/rebalance executes immediate rebalance when RUNNING."""
-    # Ensure warmup bars exist
+    # Trading requires a live relay feed; simulate one with stubbed history (no network).
+    await simulate_live_feed(service_instance)
     await service_instance._warmup_historical_bars()
 
     resp = app_client.post("/api/operator/rebalance", json={"force": True})
@@ -238,10 +240,19 @@ def test_post_operator_rebalance_paused_rejection(app_client: TestClient):
 
 @pytest.mark.asyncio
 async def test_post_operator_rebalance_force_override(app_client: TestClient, service_instance: DynamicStrategyService):
-    """POST /api/operator/rebalance with force=True executes even when PAUSED."""
-    await service_instance._warmup_historical_bars()
+    """POST /api/operator/rebalance with force=True overrides PAUSE, but never a non-live feed."""
     app_client.post("/api/operator/pause")
 
+    # Synthetic fallback feed: force must NOT bypass the data gate.
+    refused = app_client.post("/api/operator/rebalance", json={"force": True}).json()
+    assert refused["success"] is False
+    assert refused["status"] == "REJECTED_UNSAFE_FEED"
+    assert refused["orders_count"] == 0
+    assert service_instance.paper_account.get_trade_history() == []
+
+    # Live feed: force overrides the PAUSE.
+    await simulate_live_feed(service_instance)
+    await service_instance._warmup_historical_bars()
     resp = app_client.post("/api/operator/rebalance", json={"force": True})
     assert resp.status_code == 200
     data = resp.json()

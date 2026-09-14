@@ -184,9 +184,9 @@ async def test_fallback_tier2_synthetic_sde(temp_sqlite_db):
     bars_map = await manager.get_historical_bars(["QQQ"], timeframe="1Day")
     assert "QQQ" in bars_map
     assert len(bars_map["QQQ"]) > 0
-    # Bars should now also be cached in SQLite WAL
+    # Synthetic bars are served in memory only; persisting them poisoned the real bar cache.
     cached = manager.bar_repo.get_bars("QQQ", timeframe="1Day")
-    assert len(cached) > 0
+    assert cached == []
 
 
 @pytest.mark.asyncio

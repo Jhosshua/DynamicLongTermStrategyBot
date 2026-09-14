@@ -31,6 +31,7 @@ from bot.service import (
 )
 from strategy_engine.core.models import Bar, MarketRegime, OrderSide
 from strategy_engine.simulator.stress_scenarios import generate_2017_low_vol_bull
+from tests.live_feed_helper import simulate_live_feed
 
 
 @pytest.fixture
@@ -70,14 +71,18 @@ async def test_historical_warmup_and_price_caching(temp_sqlite_db):
         relay_ws_url="ws://127.0.0.1:9999",
     )
     service = DynamicStrategyService(config=config)
-    await service._warmup_historical_bars()
 
-    # Verify cached daily bars
+    # Dead relay: warmup must refuse synthetic bars (nothing cached, nothing persisted).
+    await service._warmup_historical_bars()
+    assert service._cached_daily_bars == {}
+    assert service.storage.bars.get_bars("SPY", timeframe="1Day") == []
+
+    # Live relay (stubbed history): warmup caches bars in memory and SQLite WAL.
+    await simulate_live_feed(service)
+    await service._warmup_historical_bars()
     assert len(service._cached_daily_bars) >= 10
     assert "SPY" in service._cached_daily_bars
     assert len(service._cached_daily_bars["SPY"]) > 0
-
-    # Verify SQLite WAL storage
     cached_bars = service.storage.bars.get_bars("SPY", timeframe="1Day")
     assert len(cached_bars) > 0
     await service.shutdown()
@@ -92,6 +97,7 @@ async def test_daily_close_cadence_evaluation(temp_sqlite_db):
         relay_ws_url="ws://127.0.0.1:9999",
     )
     service = DynamicStrategyService(config=config)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     dt = datetime(2026, 9, 11, 15, 50, 0, tzinfo=timezone.utc)
@@ -117,6 +123,7 @@ async def test_weekly_rebalance_execution_on_paper_ledger(temp_sqlite_db):
         relay_ws_url="ws://127.0.0.1:9999",
     )
     service = DynamicStrategyService(config=config)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     dt = datetime(2026, 9, 11, 15, 50, 0, tzinfo=timezone.utc)
@@ -154,6 +161,7 @@ async def test_drift_band_filtering(temp_sqlite_db):
         relay_ws_url="ws://127.0.0.1:9999",
     )
     service = DynamicStrategyService(config=config)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     dt = datetime(2026, 9, 11, 15, 50, 0, tzinfo=timezone.utc)
@@ -176,6 +184,7 @@ async def test_operator_pause_and_resume(temp_sqlite_db):
         relay_ws_url="ws://127.0.0.1:9999",
     )
     service = DynamicStrategyService(config=config)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     # Pause service
@@ -208,6 +217,7 @@ async def test_manual_rebalance_execution(temp_sqlite_db):
         relay_ws_url="ws://127.0.0.1:9999",
     )
     service = DynamicStrategyService(config=config)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     result = await service.manual_rebalance()
@@ -226,6 +236,7 @@ async def test_manual_rebalance_rejection_when_paused(temp_sqlite_db):
         relay_ws_url="ws://127.0.0.1:9999",
     )
     service = DynamicStrategyService(config=config)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
     await service.pause()
 
@@ -291,6 +302,7 @@ async def test_intraday_emergency_circuit_breaker(temp_sqlite_db):
         relay_ws_url="ws://127.0.0.1:9999",
     )
     service = DynamicStrategyService(config=config)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     # Open positions via rebalance
@@ -340,6 +352,12 @@ async def test_health_endpoint_contract(temp_sqlite_db):
     service = DynamicStrategyService(config=config)
     await service._warmup_historical_bars()
 
+    # No live feed: health must not claim "ok".
+    assert service.get_health()["status"] == "degraded"
+
+    # Live feed and running: "ok".
+    await simulate_live_feed(service)
+    service._service_state = ServiceState.RUNNING
     health = service.get_health()
     assert health["status"] == "ok"
     assert health["service"] == "DynamicLongTermStrategyBot"
@@ -360,6 +378,7 @@ async def test_reset_to_pristine_for_monday(temp_sqlite_db):
         relay_ws_url="ws://127.0.0.1:9999",
     )
     service = DynamicStrategyService(config=config)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     # Execute trades

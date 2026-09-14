@@ -395,7 +395,9 @@ class TestSSEConnectionStormAndAbruptDrop:
         # Assert server is still responsive and healthy
         health = httpx.get(f"{base_url}/health", timeout=3.0)
         assert health.status_code == 200
-        assert health.json()["status"] == "ok"
+        # Fixture relay is unreachable (synthetic fallback), so health must honestly say degraded.
+        assert health.json()["status"] == "degraded"
+        assert health.json()["relay"]["feed_source"] == "synthetic_fallback"
 
     @pytest.mark.asyncio
     async def test_sse_concurrent_stream_client_storm_and_task_cleanup(
@@ -806,7 +808,9 @@ class TestFullMultivectorCombinedStress:
         # Post-assault health and state verification
         post_health = httpx.get(f"{base_url}/health", timeout=3.0)
         assert post_health.status_code == 200
-        assert post_health.json()["status"] == "ok"
+        # Fixture relay is unreachable (synthetic fallback), so health must honestly say degraded.
+        assert post_health.json()["status"] == "degraded"
+        assert post_health.json()["relay"]["feed_source"] == "synthetic_fallback"
 
         st = service.get_service_status()
         assert st.state in (ServiceState.RUNNING, ServiceState.PAUSED)

@@ -105,6 +105,33 @@ class SmokeTestRunner:
         self.finished_at_dt: Optional[datetime] = None
         self.summary = SmokeTestSummary(database=Path(db_path).name, target_url=target_display_url)
 
+    async def install_live_feed_stub(self) -> None:
+        """In-process only: simulate a LIVE relay feed with local history.
+
+        Production refuses to evaluate or trade without a live AlpacaRelay feed,
+        so the harness puts the feed manager in live state and serves calibrated
+        bull-regime daily bars (ending now) instead of calling the real relay.
+        """
+        if self.service is None:
+            return
+        bull_bars, _, _ = self.generate_synthetic_universe_bars()
+        shift = datetime.now(timezone.utc) - bull_bars["SPY"][-1].timestamp
+        stub_bars = {
+            sym: [b.model_copy(update={"timestamp": b.timestamp + shift}) for b in blist]
+            for sym, blist in bull_bars.items()
+        }
+
+        async def _stub_historical_bars(symbols, timeframe="1Day", start=None, end=None):
+            return {sym: list(stub_bars[sym]) for sym in symbols if sym in stub_bars}
+
+        fm = self.service.feed_manager
+        fm.get_historical_bars = _stub_historical_bars
+        await self.service.client.state_machine.handle_upstream_connected("Smoke harness: simulated live relay")
+        await fm._transition_to_live("Smoke harness: simulated live relay")
+        fm._latest_prices.update({sym: blist[-1].close for sym, blist in stub_bars.items()})
+        if self.service._service_state == ServiceState.INITIALIZING:
+            self.service._service_state = ServiceState.RUNNING
+
     # ------------------------------------------------------------------------
     # Synthetic Data Generator Helpers
     # ------------------------------------------------------------------------
@@ -181,7 +208,13 @@ class SmokeTestRunner:
             if h_res.status_code != 200:
                 raise AssertionError(f"GET /health returned HTTP {h_res.status_code}: {h_res.text}")
             h_data = h_res.json()
-            assert h_data.get("status") == "ok", f"Expected status 'ok', got {h_data.get('status')}"
+            # Health must reflect reality: "ok" only with a live feed and a running service.
+            feed_live = h_data.get("relay", {}).get("feed_source") == "alpaca_relay"
+            svc_running = h_data.get("state") in ("RUNNING", "PAUSED")
+            expected_status = "ok" if (feed_live and svc_running) else "degraded"
+            assert h_data.get("status") == expected_status, (
+                f"Expected status '{expected_status}', got {h_data.get('status')}"
+            )
             assert h_data.get("service") == "DynamicLongTermStrategyBot", f"Invalid service: {h_data.get('service')}"
             assert h_data.get("state") in ("RUNNING", "INITIALIZING"), f"Unexpected state: {h_data.get('state')}"
 
@@ -696,6 +729,8 @@ class SmokeTestRunner:
         """Run all phases in sequence."""
         self.started_at_dt = datetime.now(timezone.utc)
         self.summary.started_at = self.started_at_dt.isoformat()
+
+        await self.install_live_feed_stub()
 
         # Phase 1
         p1 = await self.phase_1_service_boot()

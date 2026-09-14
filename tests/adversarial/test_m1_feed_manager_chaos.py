@@ -230,8 +230,8 @@ async def test_two_tier_fallback_during_disconnect(temp_sqlite_db):
             assert isinstance(price, float)
             assert price > 0.0, f"Expected positive price for {sym}, got {price}"
 
-        # In fallback mode, is_safe_to_rebalance must return True to permit paper rebalance on synthetic feed
-        assert manager.is_safe_to_rebalance() is True
+        # Synthetic fallback must never be safe to rebalance on (fail closed).
+        assert manager.is_safe_to_rebalance() is False
     finally:
         await manager.stop()
 

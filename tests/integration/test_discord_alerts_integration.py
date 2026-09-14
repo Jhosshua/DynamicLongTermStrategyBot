@@ -32,6 +32,7 @@ from bot.paper_account import PaperAccountConfig, PaperAccountManager
 from bot.service import DynamicStrategyService, ServiceConfig, ServiceState
 from strategy_engine.core.models import Bar, MarketRegime, OrderIntent, OrderSide
 from strategy_engine.simulator.stress_scenarios import generate_2017_low_vol_bull
+from tests.live_feed_helper import simulate_live_feed
 
 
 @pytest.fixture
@@ -187,6 +188,7 @@ async def test_weekly_rebalance_dispatches_trade_card(mock_relay_server, temp_sq
         dashboard_url="https://bot.railway.app",
     )
     service = DynamicStrategyService(config=config, discord_notifier=notifier)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     # Advance daily close
@@ -236,6 +238,7 @@ async def test_manual_rebalance_dispatches_trade_card(mock_relay_server, temp_sq
         dashboard_url="https://bot.railway.app",
     )
     service = DynamicStrategyService(config=config, discord_notifier=notifier)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     # Trigger manual rebalance
@@ -275,6 +278,7 @@ async def test_emergency_circuit_breaker_dispatches_trade_card(mock_relay_server
         dashboard_url="https://bot.railway.app",
     )
     service = DynamicStrategyService(config=config, discord_notifier=notifier)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     # Establish initial allocation (e.g. SPY, QQQ)
@@ -326,6 +330,7 @@ async def test_webhook_transport_failure_does_not_halt_trading(mock_relay_server
         dashboard_url="https://bot.railway.app",
     )
     service = DynamicStrategyService(config=config, discord_notifier=failing_notifier)
+    await simulate_live_feed(service)
     await service._warmup_historical_bars()
 
     # Rebalance execution proceeds smoothly despite webhook timeout

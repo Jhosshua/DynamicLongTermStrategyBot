@@ -53,6 +53,8 @@ async def smoke_harness(tmp_path: Path):
             timeout=10.0,
             target_display_url="http://127.0.0.1:8000 (Integration Pytest Harness)",
         )
+        # Simulated live relay with local history: no real network, trading gates open.
+        await runner.install_live_feed_stub()
         yield runner, client, service, db_file
 
     await service.shutdown()
