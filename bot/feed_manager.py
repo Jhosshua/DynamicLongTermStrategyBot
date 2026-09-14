@@ -155,6 +155,8 @@ class FeedManager:
         self._watchdog_task: Optional[asyncio.Task] = None
         self._synthetic_ticker_task: Optional[asyncio.Task] = None
         self._state_lock = asyncio.Lock()
+        from strategy_engine.daemon.scheduler import MarketCalendar
+        self._market_calendar = MarketCalendar()
 
         # Wire client callbacks
         self.client.ws_client.on_bar(self._on_ws_bar)
@@ -453,8 +455,13 @@ class FeedManager:
                         await self._transition_to_fallback("WebSocket stream disconnected")
                         continue
 
+                    # No bars print while the market is closed, so silence then is
+                    # normal. Checking it 24/7 flapped live/fallback every 2 minutes.
+                    now_utc = datetime.now(timezone.utc)
+                    if not self._market_calendar.is_market_open(now_utc):
+                        self._last_heartbeat = now_utc
                     if self._last_heartbeat is not None:
-                        elapsed = (datetime.now(timezone.utc) - self._last_heartbeat).total_seconds()
+                        elapsed = (now_utc - self._last_heartbeat).total_seconds()
                         if elapsed > self.config.stale_timeout_seconds:
                             logger.warning(
                                 "Feed watchdog timeout: stream silent for %.1fs > %.1fs",
