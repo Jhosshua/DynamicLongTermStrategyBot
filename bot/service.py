@@ -218,7 +218,6 @@ class DynamicStrategyService(DecisionDaemon):
             self._wire_feed_manager_alerts()
 
         self._circuit_breaker_date = None
-        self.feed_manager.on_recover(lambda _d, _t: asyncio.create_task(self._warmup_historical_bars()))
 
         # Wire feed manager bar events to intraday watchdog
         self.feed_manager.on_bar(self._on_bar_received)
@@ -278,10 +277,9 @@ class DynamicStrategyService(DecisionDaemon):
                 lookback_days=420,
             )
             if self.feed_manager.feed_source != FeedSource.ALPACA_RELAY:
-                logger.warning("Operating on fallback bars: live feed not active")
-                if not self._cached_daily_bars and bars_map:
-                    for sym, b_list in bars_map.items():
-                        self._cached_daily_bars[sym] = sorted(b_list, key=lambda b: b.timestamp)
+                # Never feed synthetic bars into the signal engine.
+                logger.warning("Warmup skipped: feed is not live, refusing synthetic bars")
+                self._cached_daily_bars = {}
                 return
             for sym, b_list in bars_map.items():
                 sorted_bars = sorted(b_list, key=lambda b: b.timestamp)
@@ -310,13 +308,17 @@ class DynamicStrategyService(DecisionDaemon):
             logger.info("DAILY_CLOSE: Service is PAUSED by operator. Skipping regime evaluation.")
             return
 
-        if self.feed_manager.feed_source != FeedSource.ALPACA_RELAY and not force:
+        if self.feed_manager.feed_source != FeedSource.ALPACA_RELAY:
             logger.warning("DAILY_CLOSE skipped: no live relay feed, refusing to evaluate synthetic data")
             return
 
         # Bars were only loaded once at startup, freezing every indicator.
-        # Refresh them on each evaluation.
-        await self._warmup_historical_bars()
+        # Refetch when the cache lacks today's daily bar (Alpaca stamps it
+        # 04:00 UTC, the 15:50 ET evaluation is ~16h later).
+        spy_cached = self._cached_daily_bars.get("SPY") if self._cached_daily_bars else None
+        eval_dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        if not spy_cached or (eval_dt - spy_cached[-1].timestamp) > timedelta(hours=20):
+            await self._warmup_historical_bars()
 
         if not self._cached_daily_bars or "SPY" not in self._cached_daily_bars:
             logger.warning("No SPY daily bars available for daily close evaluation")
@@ -662,8 +664,8 @@ class DynamicStrategyService(DecisionDaemon):
                 )
 
             # 2. Feed safety check
-            # force allows operator override even if feed is in fallback/testing
-            if not self.feed_manager.is_safe_to_rebalance() and not force:
+            # force may override PAUSE, never a dead/synthetic feed.
+            if not self.feed_manager.is_safe_to_rebalance():
                 return ManualRebalanceResult(
                     success=False,
                     status="REJECTED_UNSAFE_FEED",
