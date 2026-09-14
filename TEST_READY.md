@@ -1,3 +1,5 @@
+> **Historical (2026-09-13):** written by the original build agent. Its fallback, token-free and health claims are outdated. See MEMORY.md and PROJECT.md for current behavior.
+
 # TEST_READY — Dynamic Long-Term Strategy Bot E2E Test Suite
 
 ## 1. Test Suite Status & Executive Summary

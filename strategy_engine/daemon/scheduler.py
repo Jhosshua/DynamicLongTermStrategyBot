@@ -240,6 +240,8 @@ class MarketScheduler:
         calendar: Optional[MarketCalendar] = None,
         daily_close_offset_minutes: int = 10,
         check_interval_seconds: float = 1.0,
+        retry_interval_seconds: float = 60.0,
+        on_executed: Optional[Callable[[CadenceType, date], Any]] = None,
     ):
         self.calendar = calendar or MarketCalendar()
         self.daily_close_offset = timedelta(minutes=daily_close_offset_minutes)
@@ -250,21 +252,43 @@ class MarketScheduler:
         self._last_executed: Dict[CadenceType, Optional[date]] = {
             c: None for c in CadenceType
         }
+        # A failed or skipped cadence is retried, but at most once per
+        # retry_interval so a dead feed doesn't hammer handlers every tick.
+        self.retry_interval = timedelta(seconds=retry_interval_seconds)
+        self._next_retry_at: Dict[CadenceType, Optional[datetime]] = {
+            c: None for c in CadenceType
+        }
+        # Called after a cadence completes so the caller can persist it
+        # (in-memory state alone re-ran cadences after a mid-window restart).
+        self._on_executed = on_executed
         self._is_running: bool = False
         self._stop_event = asyncio.Event()
+
+    def restore_last_executed(self, state: Dict[CadenceType, date]) -> None:
+        """Seed completed-cadence dates loaded from persistent storage."""
+        for cadence, day in state.items():
+            self._last_executed[cadence] = day
 
     def on_cadence(self, cadence: CadenceType, handler: Callable[[datetime], Any]) -> None:
         """Register async or sync callback for a specific cadence."""
         self._handlers[cadence].append(handler)
 
     async def _dispatch(self, cadence: CadenceType, dt: datetime) -> bool:
-        """Dispatch registered handlers for cadence. Returns True if all handlers succeeded without error."""
+        """Dispatch registered handlers for cadence.
+
+        Returns True only if every handler finished. A handler that raises, or
+        returns exactly False (it skipped, e.g. no live data), leaves the
+        cadence not done so it is retried before the close.
+        """
         all_succeeded = True
         for handler in self._handlers[cadence]:
             try:
                 res = handler(dt)
                 if asyncio.iscoroutine(res):
-                    await res
+                    res = await res
+                if res is False:
+                    logger.warning("Cadence %s handler did not complete; will retry", cadence.value)
+                    all_succeeded = False
             except Exception as e:
                 logger.error("Error executing %s handler %s: %s", cadence.value, handler, e)
                 all_succeeded = False
@@ -286,39 +310,48 @@ class MarketScheduler:
         market_open, market_close = market_hours
         daily_eval_time = market_close - self.daily_close_offset
 
-        # 1. Monthly Momentum: 1st trading day of month at or before daily eval (5 min prior)
+        in_window = daily_eval_time <= now_et < market_close
+
+        # 1. Monthly Momentum: 1st trading day of month, 5 min before daily eval
         if self.calendar.is_first_trading_day_of_month(today):
-            monthly_time = daily_eval_time - timedelta(minutes=5)
-            if now_et >= monthly_time and now_et < market_close:
-                if self._last_executed[CadenceType.MONTHLY_MOMENTUM] != today:
-                    success = await self._dispatch(CadenceType.MONTHLY_MOMENTUM, now_et)
-                    if success:
-                        self._last_executed[CadenceType.MONTHLY_MOMENTUM] = today
-                        triggered.append(CadenceType.MONTHLY_MOMENTUM)
+            if daily_eval_time - timedelta(minutes=5) <= now_et < market_close:
+                await self._run_cadence(CadenceType.MONTHLY_MOMENTUM, now_et, today, triggered)
 
         # 2. Daily Close Evaluation: 10 min before close (15:50 ET regular or 12:50 ET early close)
-        if now_et >= daily_eval_time and now_et < market_close:
-            if self._last_executed[CadenceType.DAILY_CLOSE] != today:
-                success = await self._dispatch(CadenceType.DAILY_CLOSE, now_et)
-                if success:
-                    self._last_executed[CadenceType.DAILY_CLOSE] = today
-                    triggered.append(CadenceType.DAILY_CLOSE)
-                else:
-                    logger.warning(
-                        "Cadence %s handler failed; will retry on subsequent ticks before market close",
-                        CadenceType.DAILY_CLOSE.value,
-                    )
+        if in_window:
+            await self._run_cadence(CadenceType.DAILY_CLOSE, now_et, today, triggered)
 
         # 3. Weekly Rebalance: Last trading day of week at 15:50 ET (or 12:50 ET early close)
-        if self.calendar.is_last_trading_day_of_week(today):
-            if now_et >= daily_eval_time and now_et < market_close:
-                if self._last_executed[CadenceType.WEEKLY_REBALANCE] != today:
-                    success = await self._dispatch(CadenceType.WEEKLY_REBALANCE, now_et)
-                    if success:
-                        self._last_executed[CadenceType.WEEKLY_REBALANCE] = today
-                        triggered.append(CadenceType.WEEKLY_REBALANCE)
+        if in_window and self.calendar.is_last_trading_day_of_week(today):
+            await self._run_cadence(CadenceType.WEEKLY_REBALANCE, now_et, today, triggered)
 
         return triggered
+
+    async def _run_cadence(
+        self, cadence: CadenceType, now_et: datetime, today: date, triggered: List[CadenceType]
+    ) -> None:
+        """Run a cadence once per day, retrying failures no faster than retry_interval."""
+        if self._last_executed[cadence] == today:
+            return
+        next_retry = self._next_retry_at[cadence]
+        if next_retry is not None and now_et < next_retry:
+            return
+        if await self._dispatch(cadence, now_et):
+            self._last_executed[cadence] = today
+            self._next_retry_at[cadence] = None
+            triggered.append(cadence)
+            if self._on_executed:
+                try:
+                    self._on_executed(cadence, today)
+                except Exception as e:
+                    logger.error("Failed to persist %s completion: %s", cadence.value, e)
+        else:
+            self._next_retry_at[cadence] = now_et + self.retry_interval
+            logger.warning(
+                "Cadence %s not completed; retrying after %s until market close",
+                cadence.value,
+                self._next_retry_at[cadence].strftime("%H:%M:%S"),
+            )
 
     async def run(self) -> None:
         """Run the periodic scheduler tick loop until stop() is called."""

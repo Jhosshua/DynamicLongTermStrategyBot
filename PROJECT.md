@@ -3,11 +3,11 @@
 ## Architecture
 The Dynamic Long-Term Strategy Bot is an institutional-grade automated trading system executing a 4-regime dynamic allocation strategy on US equity instruments (SPY, QQQ, top sectors, TLT, SHV/BIL, GLD). The bot is architected as an integrated single-process async daemon and web server providing:
 1. **Virtual Paper Trading Engine**: Isolated $50,000.00 starting cash balance, persistent SQLite WAL storage, position tracking, P&L calculations, and execution history.
-2. **Resilient Data Ingestion**: AlpacaRelay REST & WebSocket client with automatic fallback to historical/synthetic market simulation upon upstream disconnects, accompanied by visual dashboard alert flags.
+2. **Resilient Data Ingestion**: AlpacaRelay REST & WebSocket client with a synthetic price display when the relay is down, plus a dashboard alert banner. The bot never evaluates signals or trades unless the live relay feed is up (fail closed).
 3. **Institutional Discord v2 Notifications**: Rate-limited (<= 1 post/2s, 429 exponential backoff) rich embed cards (`broken`, `recovered`, `trade_execution`) with deep links to the public dashboard and pytest suppression.
 4. **Light & Airy Operator Dashboard**: Fast, mobile-first responsive web interface (375px–430px) featuring modern soft-slate/pure-white palette, operator controls (Pause/Resume, Manual Rebalance), live regime & signal metrics, and AlpacaRelay status badge.
 5. **E2E Verification & Pristine Reset**: Injected synthetic stress smoke tests verifying reactive UI and order execution, followed by a guaranteed purge and reset to pristine $50,000.00 cash balance for Monday's market open.
-6. **Public Cloud Deployment**: Dedicated Git repository under `Jhosshua` and Railway public HTTPS deployment with unauthenticated `/health` (200 OK) and dashboard monitoring.
+6. **Public Cloud Deployment**: Dedicated Git repository under `Jhosshua` and Railway public HTTPS deployment. Viewing (`/`, `/health`, GET APIs) is public; operator POSTs need `X-Operator-Token`.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -43,7 +43,7 @@ The Dynamic Long-Term Strategy Bot is an institutional-grade automated trading s
 | 1 | $50k Paper Account Initialization | Initialize isolated paper trading account with exactly $50,000.00 cash balance in SQLite WAL | M1 | ORIGINAL_REQUEST R1 |
 | 2 | Persistent Paper Portfolio Ledger | SQLite WAL tables tracking positions, cash balance, realized/unrealized P&L, order intents, and execution history across restarts | M1 | ORIGINAL_REQUEST R1 |
 | 3 | AlpacaRelay Ingestion Client | REST and WebSocket client connecting to AlpacaRelay proxy with `RELAY_TOKEN` authentication | M1 | ORIGINAL_REQUEST R1 |
-| 4 | Disconnect Detection & Fallback Simulation | Detect `upstream_disconnected` or REST failures, seamlessly fall back to historical/synthetic market simulation, set dashboard banner alert flag | M1 | ORIGINAL_REQUEST R1 |
+| 4 | Disconnect Detection & Fallback Simulation | Detect `upstream_disconnected` or REST failures, switch to synthetic display prices, set dashboard banner alert flag, and refuse all evaluation and trading until live | M1 | ORIGINAL_REQUEST R1 |
 | 5 | 4-Regime Strategy Integration | Execute 4-regime dynamic long-term rebalancing logic, drift bands, vol scaling, and Antonacci safe-haven rotation on paper portfolio | M1 | ORIGINAL_REQUEST R1 |
 | 6 | Discord v2 Broken Alert Card | Institutional red embed card (0xE53935) dispatched on disconnects or runtime errors with evidence and dashboard link | M2 | ORIGINAL_REQUEST R3 |
 | 7 | Discord v2 Recovered Alert Card | Institutional green embed card (0x43A047) dispatched on reconnection/recovery with duration and metrics | M2 | ORIGINAL_REQUEST R3 |
@@ -59,7 +59,7 @@ The Dynamic Long-Term Strategy Bot is an institutional-grade automated trading s
 | 17 | Pristine State Reset for Monday's Open | Complete purge of synthetic test data, resetting paper portfolio to clean $50,000.00 cash, 0 positions, 0 open orders | M4 | ORIGINAL_REQUEST R4 |
 | 18 | Dedicated Git Repository Setup | Initialize Git repo at `/Users/mo/DynamicLongTermStrategyBot`, commit all code with clean structured commits | M5 | ORIGINAL_REQUEST R5 |
 | 19 | GitHub Remote Push (`Jhosshua`) | Create and push to GitHub repository under account `Jhosshua/DynamicLongTermStrategyBot` | M5 | ORIGINAL_REQUEST R5 |
-| 20 | Public Token-Free Railway Deployment | Deploy service to Railway with publicly accessible token-free HTTPS URL, verifying HTTP 200 on `/health` and dashboard | M5 | ORIGINAL_REQUEST R5 |
+| 20 | Public Token-Free Railway Deployment | Deploy service to Railway with a public read-only HTTPS URL; operator controls need `OPERATOR_TOKEN` | M5 | ORIGINAL_REQUEST R5 |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
@@ -95,10 +95,12 @@ The Dynamic Long-Term Strategy Bot is an institutional-grade automated trading s
 - `DiscordNotifier.post_recovered_alert(component: str, downtime_duration_s: float, status_info: str, dashboard_url: str) -> bool`
 
 ### M3 (Dashboard Controls) ↔ Bot Daemon
+All operator POSTs require header `X-Operator-Token` matching env `OPERATOR_TOKEN` (403 if unset in production, 401 if wrong). Dashboard: open `/#token=SECRET` once per browser.
 - `POST /api/operator/pause`: Sets daemon state to `PAUSED`. Freezes rebalance evaluation.
 - `POST /api/operator/resume`: Resets daemon state to `RUNNING`.
-- `POST /api/operator/rebalance`: Triggers immediate out-of-cadence strategy rebalance evaluation.
-- `GET /health`: Returns `{"status": "ok", "service": "DynamicLongTermStrategyBot", "relay": {...}, "portfolio": {"nav": 50000.0}}`.
+- `POST /api/operator/rebalance`: Out-of-cadence evaluation. `force` overrides PAUSE only, never a non-live feed (`REJECTED_UNSAFE_FEED`).
+- `POST /api/operator/reset`: Wipes the paper account back to $50,000.
+- `GET /health`: `status` is `"ok"` only when the feed is live and the service is RUNNING/PAUSED, else `"degraded"` (HTTP 200 either way).
 
 ## Code Layout
 ```

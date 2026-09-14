@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 import inspect
 import logging
@@ -222,10 +222,65 @@ class DynamicStrategyService(DecisionDaemon):
         # Wire feed manager bar events to intraday watchdog
         self.feed_manager.on_bar(self._on_bar_received)
 
-        # Re-bind scheduler cadence callbacks to service implementations
-        self.scheduler.on_cadence(CadenceType.DAILY_CLOSE, self._handle_daily_close)
-        self.scheduler.on_cadence(CadenceType.WEEKLY_REBALANCE, self._handle_weekly_rebalance)
-        self.scheduler.on_cadence(CadenceType.MONTHLY_MOMENTUM, self._handle_monthly_momentum)
+        # Re-bind scheduler cadence callbacks to service implementations.
+        # The base class already registered these bound methods, and appending
+        # again made every cadence (incl. the weekly rebalance) run twice.
+        self._cadence_skipped = False
+        for cadence, handler in (
+            (CadenceType.DAILY_CLOSE, self._handle_daily_close),
+            (CadenceType.WEEKLY_REBALANCE, self._handle_weekly_rebalance),
+            (CadenceType.MONTHLY_MOMENTUM, self._handle_monthly_momentum),
+        ):
+            self.scheduler._handlers[cadence] = []
+            self.scheduler.on_cadence(cadence, self._scheduled(handler))
+
+        # Persist completed cadences so a restart inside the 15:50-16:00 window
+        # neither re-runs a finished rebalance nor forgets what already ran.
+        self._init_scheduler_state()
+        self.scheduler._on_executed = self._save_cadence_done
+
+    def _scheduled(self, handler: Callable[[datetime], Any]) -> Callable[[datetime], Any]:
+        """Wrap a cadence handler so a quiet skip reports "not done" (False).
+
+        Handlers skip by returning early (paused, no live feed, no bars). The
+        scheduler used to count that as done, so a 15:50 skip was never retried.
+        """
+        async def run(dt: datetime) -> bool:
+            self._cadence_skipped = False
+            await handler(dt)
+            return not self._cadence_skipped
+
+        return run
+
+    def _init_scheduler_state(self) -> None:
+        if not self.storage:
+            return
+        try:
+            with self.storage.db.transaction() as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS scheduler_state ("
+                    "cadence TEXT PRIMARY KEY, last_executed_date TEXT NOT NULL)"
+                )
+                rows = conn.execute("SELECT cadence, last_executed_date FROM scheduler_state").fetchall()
+            state = {}
+            for cadence_name, day in rows:
+                try:
+                    state[CadenceType(cadence_name)] = date.fromisoformat(day)
+                except ValueError:
+                    logger.warning("Ignoring bad scheduler_state row: %s=%s", cadence_name, day)
+            self.scheduler.restore_last_executed(state)
+        except Exception as e:
+            logger.error("Could not load scheduler state (cadences may re-run after restart): %s", e)
+
+    def _save_cadence_done(self, cadence: CadenceType, day: date) -> None:
+        if not self.storage:
+            return
+        with self.storage.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO scheduler_state (cadence, last_executed_date) VALUES (?, ?) "
+                "ON CONFLICT(cadence) DO UPDATE SET last_executed_date = excluded.last_executed_date",
+                (cadence.value, day.isoformat()),
+            )
 
     def _wire_feed_manager_alerts(self) -> None:
         """Wire DataFeedManager lifecycle events to DiscordNotifier."""
@@ -306,10 +361,12 @@ class DynamicStrategyService(DecisionDaemon):
         # 1. Check if paused
         if self._service_state == ServiceState.PAUSED and not force:
             logger.info("DAILY_CLOSE: Service is PAUSED by operator. Skipping regime evaluation.")
+            self._cadence_skipped = True
             return
 
         if self.feed_manager.feed_source != FeedSource.ALPACA_RELAY:
             logger.warning("DAILY_CLOSE skipped: no live relay feed, refusing to evaluate synthetic data")
+            self._cadence_skipped = True
             return
 
         # Bars were only loaded once at startup, freezing every indicator.
@@ -322,6 +379,7 @@ class DynamicStrategyService(DecisionDaemon):
 
         if not self._cached_daily_bars or "SPY" not in self._cached_daily_bars:
             logger.warning("No SPY daily bars available for daily close evaluation")
+            self._cadence_skipped = True
             return
 
         is_safe = self.feed_manager.is_safe_to_rebalance()
@@ -403,6 +461,7 @@ class DynamicStrategyService(DecisionDaemon):
                         timestamp=dt,
                         rationale="WEEKLY_REBALANCE suppressed: Operator paused.",
                     )
+                self._cadence_skipped = True
                 return []
 
             # 2. Feed safety check
@@ -415,6 +474,7 @@ class DynamicStrategyService(DecisionDaemon):
                         timestamp=dt,
                         rationale="Rebalance strictly suppressed due to unsafe data feed.",
                     )
+                self._cadence_skipped = True
                 return []
 
             # 3. Allocation freshness check
@@ -423,6 +483,7 @@ class DynamicStrategyService(DecisionDaemon):
 
             if self._latest_allocation is None:
                 logger.warning("No target allocation available; skipping weekly rebalance")
+                self._cadence_skipped = True
                 return []
 
             # 4. Read portfolio state from real paper account
