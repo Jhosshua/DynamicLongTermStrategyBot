@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -84,6 +84,26 @@ class ErrorResponse(BaseModel):
 # Dependency Injection
 # ---------------------------------------------------------------------------
 
+def require_operator(request: Request) -> None:
+    """Gate operator POSTs (pause/resume/rebalance/reset).
+
+    These were fully public, so anyone with the URL could wipe the account.
+    Production (no injected service) needs OPERATOR_TOKEN set and a matching
+    X-Operator-Token header; with no token set, controls are disabled.
+    Test apps built with an injected service only enforce it when set.
+    """
+    import hmac
+
+    expected = os.environ.get("OPERATOR_TOKEN", "")
+    if not expected:
+        if getattr(request.app.state, "_service_injected", False):
+            return
+        raise HTTPException(status_code=403, detail="Operator controls disabled: OPERATOR_TOKEN not configured.")
+    supplied = request.headers.get("X-Operator-Token", "")
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing operator token.")
+
+
 def get_strategy_service(request: Request) -> DynamicStrategyService:
     """Dependency resolver for DynamicStrategyService from app.state."""
     service: Optional[DynamicStrategyService] = getattr(request.app.state, "service", None)
@@ -117,8 +137,17 @@ def create_app(
         svc: Optional[DynamicStrategyService] = getattr(app.state, "service", None)
         svc_task = None
         if svc is None:
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
             logger.info("Instantiating default DynamicStrategyService instance...")
-            svc = DynamicStrategyService()
+            from bot.service import ServiceConfig
+            cfg = ServiceConfig.from_env()
+            if not cfg.relay_token:
+                logger.error("RELAY_TOKEN is not set: the bot cannot reach live market data and will not trade.")
+            notifier = None
+            if os.environ.get("DISCORD_WEBHOOK_URL"):
+                from bot.discord_alerts import DiscordNotifier
+                notifier = DiscordNotifier()
+            svc = DynamicStrategyService(config=cfg, discord_notifier=notifier)
             app.state.service = svc
 
         auto_start = getattr(app.state, "auto_start_service", None)
@@ -413,7 +442,7 @@ def create_app(
             },
         )
 
-    @app.post("/api/operator/pause", response_model=OperatorActionResponse, tags=["Operator"])
+    @app.post("/api/operator/pause", response_model=OperatorActionResponse, tags=["Operator"], dependencies=[Depends(require_operator)])
     async def operator_pause(service: DynamicStrategyService = Depends(get_strategy_service)):
         """Pause automated rebalancing evaluations."""
         status_obj = await service.pause()
@@ -425,7 +454,7 @@ def create_app(
             status=status_obj.to_dict(),
         )
 
-    @app.post("/api/operator/resume", response_model=OperatorActionResponse, tags=["Operator"])
+    @app.post("/api/operator/resume", response_model=OperatorActionResponse, tags=["Operator"], dependencies=[Depends(require_operator)])
     async def operator_resume(service: DynamicStrategyService = Depends(get_strategy_service)):
         """Resume automated rebalancing evaluations."""
         status_obj = await service.resume()
@@ -437,7 +466,7 @@ def create_app(
             status=status_obj.to_dict(),
         )
 
-    @app.post("/api/operator/rebalance", tags=["Operator"])
+    @app.post("/api/operator/rebalance", tags=["Operator"], dependencies=[Depends(require_operator)])
     async def operator_rebalance(
         payload: Optional[OperatorRebalanceRequest] = None,
         service: DynamicStrategyService = Depends(get_strategy_service),
@@ -447,7 +476,7 @@ def create_app(
         result: ManualRebalanceResult = await service.manual_rebalance(force=force)
         return result.to_dict()
 
-    @app.post("/api/operator/reset", tags=["Operator"])
+    @app.post("/api/operator/reset", tags=["Operator"], dependencies=[Depends(require_operator)])
     async def operator_reset(service: DynamicStrategyService = Depends(get_strategy_service)):
         """Pristine reset restoring $50,000.00 cash balance and purging test state."""
         summary = await asyncio.to_thread(service.reset_to_pristine)
@@ -460,7 +489,7 @@ def create_app(
 
     @app.get("/api/trades", tags=["Activity"])
     async def get_trades(
-        limit: int = 50,
+        limit: int = Query(50, ge=1, le=1000),
         service: DynamicStrategyService = Depends(get_strategy_service),
     ):
         """Fetch chronologically ordered execution trade records."""
@@ -469,7 +498,7 @@ def create_app(
 
     @app.get("/api/equity-history", tags=["Activity"])
     async def get_equity_history(
-        limit: int = 100,
+        limit: int = Query(100, ge=1, le=5000),
         service: DynamicStrategyService = Depends(get_strategy_service),
     ):
         """Fetch historical equity snapshots for performance charting."""

@@ -439,6 +439,22 @@ function showFeedback(msg, isError = false) {
     }, 5000);
 }
 
+
+// Operator token: open the dashboard once as /#token=SECRET and it is kept in
+// this browser. Viewing stays public; control buttons need the token.
+function operatorHeaders() {
+    try {
+        const m = location.hash.match(/token=([^&]+)/);
+        if (m) {
+            localStorage.setItem('operatorToken', decodeURIComponent(m[1]));
+            history.replaceState(null, '', location.pathname + location.search);
+        }
+        return { 'X-Operator-Token': localStorage.getItem('operatorToken') || '' };
+    } catch (e) {
+        return {};
+    }
+}
+
 async function operatorPause() {
     if (AppState.inFlightAction) return;
     AppState.inFlightAction = true;
@@ -448,7 +464,7 @@ async function operatorPause() {
     btn.disabled = true;
 
     try {
-        const res = await fetch('/api/operator/pause', { method: 'POST' });
+        const res = await fetch('/api/operator/pause', { method: 'POST', headers: operatorHeaders() });
         const json = await res.json();
         if (res.ok) {
             updateStatusUI({ state: 'PAUSED' });
@@ -476,7 +492,7 @@ async function operatorResume() {
     btn.disabled = true;
 
     try {
-        const res = await fetch('/api/operator/resume', { method: 'POST' });
+        const res = await fetch('/api/operator/resume', { method: 'POST', headers: operatorHeaders() });
         const json = await res.json();
         if (res.ok) {
             updateStatusUI({ state: 'RUNNING' });
@@ -516,7 +532,7 @@ async function executeManualRebalance() {
     btn.disabled = true;
 
     try {
-        const res = await fetch('/api/operator/rebalance', { method: 'POST' });
+        const res = await fetch('/api/operator/rebalance', { method: 'POST', headers: operatorHeaders() });
         const json = await res.json();
         if (res.ok) {
             if (!json.success || (json.status && json.status.startsWith('REJECTED'))) {

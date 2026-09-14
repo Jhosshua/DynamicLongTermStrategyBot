@@ -254,7 +254,7 @@ class FeedManager:
                             for sb in spy_bars
                         ]
                     if b_list:
-                        self.bar_repo.save_bars(b_list, timeframe="1Day")
+                        # Memory only: persisting fake bars poisoned the real bar cache.
                         self._latest_bars[sym] = b_list[-1]
                         self._latest_prices[sym] = b_list[-1].close
             except Exception as e:
@@ -267,7 +267,7 @@ class FeedManager:
             if health.get("upstream") == "connected":
                 await self.client.connect_stream(
                     symbols=self.config.universe_symbols,
-                    channels=["bars", "quotes", "trades"],
+                    channels=["bars"],
                 )
                 # Brief yield to ensure subscription is acknowledged on socket
                 await asyncio.sleep(0.05)
@@ -303,6 +303,11 @@ class FeedManager:
             if self._synthetic_ticker_task and not self._synthetic_ticker_task.done():
                 self._synthetic_ticker_task.cancel()
                 self._synthetic_ticker_task = None
+
+            # Drop synthetic prices so fills/marks use real data (live bars or the
+            # stored real daily closes). Keeping them filled SPY at ~$266 vs $764.
+            self._latest_prices.clear()
+            self._latest_bars.clear()
 
             logger.info("FeedManager transitioned to LIVE: %s (downtime: %.1fs)", reason, downtime)
 
@@ -485,7 +490,7 @@ class FeedManager:
                             logger.info("Auto-recovery: upstream is online. Re-connecting WebSocket stream...")
                             await self.client.connect_stream(
                                 symbols=self.config.universe_symbols,
-                                channels=["bars", "quotes", "trades"],
+                                channels=["bars"],
                             )
 
                             # Gap check & backfill if downtime > 60 seconds
@@ -591,7 +596,6 @@ class FeedManager:
                             for sb in spy_bars
                         ]
                     if syn_bars:
-                        self.bar_repo.save_bars(syn_bars, timeframe=timeframe)
                         result[sym] = syn_bars
             except Exception as se:
                 logger.error("Error generating synthetic scenario: %s", se)
@@ -645,12 +649,13 @@ class FeedManager:
     def is_safe_to_rebalance(self) -> bool:
         """
         Gate check for rebalancing safety.
-        When operating in synthetic fallback simulation, synthetic bars are actively provided,
-        so rebalancing is safe (returns True) while alert_banner_active remains True.
-        In live mode, delegates to client.is_safe_to_rebalance().
+        Synthetic fallback is never safe to trade on. In live mode, delegates to
+        client.is_safe_to_rebalance().
         """
+        # Never trade on made-up prices. The old code returned True here, so the
+        # paper account would rebalance off synthetic 2017-scenario bars.
         if self._feed_source == FeedSource.SYNTHETIC_FALLBACK:
-            return True
+            return False
         return self.client.is_safe_to_rebalance()
 
     def get_connection_status(self) -> ConnectionStatus:

@@ -93,8 +93,14 @@ class AlpacaRelayClient:
             logger.warning("Initial health check failed: %s", e)
             await self.state_machine.handle_upstream_disconnected("Health check failed on connect_stream")
 
-        await self.ws_client.connect()
-        await self.ws_client.connect_stream(symbols=symbols, channels=channels)
+        # Health can say "safe" before the socket exists; if connect/auth fails,
+        # drop back to STALE_DATA_HOLD so the rebalance gate stays closed.
+        try:
+            await self.ws_client.connect()
+            await self.ws_client.connect_stream(symbols=symbols, channels=channels)
+        except Exception:
+            await self.state_machine.handle_upstream_disconnected("WebSocket connect/auth failed")
+            raise
 
     async def handle_lifecycle_event(self, event_type: str) -> None:
         """Handle upstream lifecycle events from relay."""

@@ -117,6 +117,25 @@ class ServiceConfig:
     dry_run: bool = False                   # In production bot, executes real paper orders
     dashboard_url: str = "https://dynamiclongtermstrategybot-production.up.railway.app"
 
+    @classmethod
+    def from_env(cls) -> "ServiceConfig":
+        """Build config from environment variables (production entry point).
+
+        Before this existed nothing read the environment, so the deployed bot
+        dialed ws://localhost with an empty token and never reached the relay.
+        """
+        import os
+
+        base = cls()
+        return cls(
+            db_path=os.environ.get("DB_PATH", base.db_path),
+            log_dir=os.environ.get("LOG_DIR", base.log_dir),
+            relay_base_url=os.environ.get("RELAY_BASE_URL", base.relay_base_url),
+            relay_ws_url=os.environ.get("RELAY_WS_URL", "wss://alpacarelay-production.up.railway.app"),
+            relay_token=os.environ.get("RELAY_TOKEN", ""),
+            dashboard_url=os.environ.get("DASHBOARD_URL", base.dashboard_url),
+        )
+
 
 class DynamicStrategyService(DecisionDaemon):
     """
@@ -198,6 +217,9 @@ class DynamicStrategyService(DecisionDaemon):
         if self.discord_notifier and getattr(self.feed_manager, "discord_notifier", None) is None:
             self._wire_feed_manager_alerts()
 
+        self._circuit_breaker_date = None
+        self.feed_manager.on_recover(lambda _d, _t: asyncio.create_task(self._warmup_historical_bars()))
+
         # Wire feed manager bar events to intraday watchdog
         self.feed_manager.on_bar(self._on_bar_received)
 
@@ -249,10 +271,18 @@ class DynamicStrategyService(DecisionDaemon):
         """Fetch historical daily bars via FeedManager to warm up indicators."""
         logger.info("Warming up historical daily bars for %d symbols via FeedManager...", len(self.config.symbols))
         try:
+            # 365 calendar days is ~251 trading bars, but 12-1 momentum needs
+            # 253+, so momentum silently read 0 and sectors/TLT/GLD never qualified.
             bars_map = await self.feed_manager.get_historical_daily_bars(
                 symbols=self.config.symbols,
-                lookback_days=365,
+                lookback_days=420,
             )
+            if self.feed_manager.feed_source != FeedSource.ALPACA_RELAY:
+                logger.warning("Operating on fallback bars: live feed not active")
+                if not self._cached_daily_bars and bars_map:
+                    for sym, b_list in bars_map.items():
+                        self._cached_daily_bars[sym] = sorted(b_list, key=lambda b: b.timestamp)
+                return
             for sym, b_list in bars_map.items():
                 sorted_bars = sorted(b_list, key=lambda b: b.timestamp)
                 self._cached_daily_bars[sym] = sorted_bars
@@ -280,12 +310,20 @@ class DynamicStrategyService(DecisionDaemon):
             logger.info("DAILY_CLOSE: Service is PAUSED by operator. Skipping regime evaluation.")
             return
 
+        if self.feed_manager.feed_source != FeedSource.ALPACA_RELAY and not force:
+            logger.warning("DAILY_CLOSE skipped: no live relay feed, refusing to evaluate synthetic data")
+            return
+
+        # Bars were only loaded once at startup, freezing every indicator.
+        # Refresh them on each evaluation.
+        await self._warmup_historical_bars()
+
         if not self._cached_daily_bars or "SPY" not in self._cached_daily_bars:
             logger.warning("No SPY daily bars available for daily close evaluation")
             return
 
         is_safe = self.feed_manager.is_safe_to_rebalance()
-        feed_active = self.feed_manager.is_connected or (self.feed_manager.feed_source == FeedSource.SYNTHETIC_FALLBACK)
+        feed_active = self.feed_manager.is_connected
         signals = self.signal_engine.compute_daily_signals(
             market_data=self._cached_daily_bars,
             current_time=dt,
@@ -469,6 +507,16 @@ class DynamicStrategyService(DecisionDaemon):
         """Intraday streaming bar listener and circuit breaker watchdog."""
         self._latest_intraday_bars[bar.symbol] = bar
 
+        # Synthetic ticks must never liquidate the account.
+        if self.feed_manager.feed_source != FeedSource.ALPACA_RELAY:
+            return
+
+        # The flag was never reset, so the breaker fired at most once per process.
+        # Re-arm it when the calendar day changes.
+        today = bar.timestamp.date()
+        if getattr(self, "_circuit_breaker_date", None) != today:
+            self._circuit_breaker_triggered_today = False
+
         # Circuit breaker monitoring on SPY bars
         if bar.symbol == "SPY" and not self._circuit_breaker_triggered_today:
             keltner_lower = None
@@ -486,6 +534,7 @@ class DynamicStrategyService(DecisionDaemon):
                 )
                 logger.critical("EMERGENCY CIRCUIT BREAKER TRIGGERED: %s", trigger_reason)
                 self._circuit_breaker_triggered_today = True
+                self._circuit_breaker_date = today
                 asyncio.create_task(self._trigger_emergency_circuit_breaker(bar, trigger_reason))
 
     async def _trigger_emergency_circuit_breaker(self, bar: Bar, reason: str) -> None:
@@ -613,11 +662,12 @@ class DynamicStrategyService(DecisionDaemon):
                 )
 
             # 2. Feed safety check
+            # force allows operator override even if feed is in fallback/testing
             if not self.feed_manager.is_safe_to_rebalance() and not force:
                 return ManualRebalanceResult(
                     success=False,
                     status="REJECTED_UNSAFE_FEED",
-                    rationale="Market data feed is unsafe / STALE_DATA_HOLD. Use force=True to override.",
+                    rationale="Market data feed is not live (synthetic or STALE_DATA_HOLD). Trading refused.",
                     orders_count=0,
                     executed_trades_count=0,
                     total_bought=0.0,
@@ -727,8 +777,10 @@ class DynamicStrategyService(DecisionDaemon):
         """Return standard unauthenticated /health dictionary for Railway monitoring."""
         status = self.get_service_status()
         conn_status = self.feed_manager.get_connection_status()
+        live = self.feed_manager.feed_source == FeedSource.ALPACA_RELAY
+        running = status.state in (ServiceState.RUNNING, ServiceState.PAUSED)
         return {
-            "status": "ok",
+            "status": "ok" if (live and running) else "degraded",
             "service": status.service_name,
             "state": status.state.value,
             "relay": conn_status.to_dict(),
@@ -763,7 +815,8 @@ class DynamicStrategyService(DecisionDaemon):
         """Start all background loops, feed listeners, and scheduler."""
         logger.info("Starting DynamicStrategyService (initial_cash=$%.2f)...", self.service_config.initial_cash)
         self._stop_event.clear()
-        self._setup_signal_handlers()
+        # No signal handlers here: uvicorn owns SIGTERM/SIGINT and calls shutdown()
+        # via the lifespan. Hijacking them left the web server up with a STOPPED bot.
 
         # 1. Initialize SQLite schema & paper account ledger
         self.paper_account.init_schema()
