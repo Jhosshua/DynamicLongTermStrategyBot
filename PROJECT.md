@@ -68,7 +68,7 @@ The Dynamic Long-Term Strategy Bot is an institutional-grade automated trading s
 | M2 | Discord v2 Institutional Alert Engine | Features 6, 7, 8, 9: Broken, recovered, trade execution embed cards, rate limiter, exponential backoff, pytest suppression | M1 | DONE |
 | M3 | Mobile-Centric Light & Airy Operator Dashboard | Features 10, 11, 12, 13, 14: FastAPI + SSE server, light/airy UI, 375px–430px layout, alert banner, operator controls | M1 | DONE |
 | M4 | Adversarial E2E Smoke Testing & Pristine Reset | Features 15, 16, 17: Multi-agent adversarial testing, injected fake data smoke test, UI review, wipe and reset to $50,000.00 for Monday | M1, M2, M3 | DONE |
-| M5 | Dedicated Git Repository & Public Railway Deployment | Features 18, 19, 20: Git init, commit history, GitHub push to `Jhosshua`, Railway deployment, public URL and health check verification | M4 | IN_PROGRESS |
+| M5 | Dedicated Git Repository & Public Railway Deployment | Features 18, 19, 20: Git init, commit history, GitHub push to `Jhosshua`, Railway deployment, public URL and health check verification | M4 | DONE |
 
 ## Interface Contracts
 

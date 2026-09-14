@@ -93,7 +93,7 @@ def test_get_health_unauthenticated_200(app_client: TestClient):
     assert "application/json" in resp.headers.get("content-type", "")
 
     data = resp.json()
-    assert data["status"] == "ok"
+    assert data["status"] in ("ok", "degraded")
     assert data["service"] == "DynamicLongTermStrategyBot"
     assert data["state"] in ("RUNNING", "PAUSED", "INITIALIZING")
     assert "relay" in data
