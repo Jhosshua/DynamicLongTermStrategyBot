@@ -19,3 +19,11 @@
 - What did not work: trusting `EXECUTED` from /api/operator/rebalance.
 - What worked: compare `paper_trades.price` against the real last daily close in `market_bars`.
 - Note: always check fill prices against a real source.
+
+## Railway logs pull returned nothing (2026-09-15)
+- What did not work: `railway logs -d --since ... -n 20000` ("Error in limit"),
+  `2>/dev/null` (the CLI prints log lines on stderr), and a zsh loop with
+  `set -- $w` (zsh does not word-split, the two timestamps became one string).
+- What worked: `-n 2000` per 15-minute window, `2>&1`, bash script with
+  `date -u -j` arithmetic. Helper kept at the session scratchpad as pull_logs.sh.
+- Note: relay logs are 90% health-probe noise ("connection rejected (200 OK)"), grep it out.

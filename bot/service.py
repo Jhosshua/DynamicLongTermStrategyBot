@@ -116,6 +116,11 @@ class ServiceConfig:
     tick_interval_seconds: float = 1.0      # Scheduler tick interval
     dry_run: bool = False                   # In production bot, executes real paper orders
     dashboard_url: str = "https://dynamiclongtermstrategybot-production.up.railway.app"
+    # Railway's edge cuts the relay websocket every few minutes; the bot
+    # reconnects in ~2-3s. Without a grace period every blip posted a BROKEN
+    # and a RECOVERED card (345 Discord posts on 2026-09-14). Only outages
+    # longer than this get a card, and RECOVERED only follows a posted BROKEN.
+    alert_grace_seconds: float = 90.0
 
     @classmethod
     def from_env(cls) -> "ServiceConfig":
@@ -283,8 +288,17 @@ class DynamicStrategyService(DecisionDaemon):
             )
 
     def _wire_feed_manager_alerts(self) -> None:
-        """Wire DataFeedManager lifecycle events to DiscordNotifier."""
-        def _on_disconnect(reason: str, ts: datetime) -> None:
+        """Wire DataFeedManager lifecycle events to DiscordNotifier.
+
+        A disconnect arms a timer. If the feed is still down when it fires,
+        the BROKEN card is posted; a recovery before then cancels it silently.
+        RECOVERED is posted only when a BROKEN card actually went out, so a
+        2-second edge blip produces no Discord traffic at all.
+        """
+        self._broken_alert_task: Optional[asyncio.Task] = None
+        self._broken_alert_posted: bool = False
+
+        def _post_broken(reason: str, ts: datetime) -> None:
             if self.discord_notifier and hasattr(self.discord_notifier, "post_broken_alert"):
                 try:
                     evidence = f"Reason: {reason} | Disconnect: {ts.isoformat()}"
@@ -297,10 +311,46 @@ class DynamicStrategyService(DecisionDaemon):
                     )
                     if inspect.isawaitable(res):
                         asyncio.create_task(res)
+                    self._broken_alert_posted = True
                 except Exception as e:
                     logger.error("Failed to post Discord broken alert on feed disconnect: %s", e)
 
+        async def _broken_after_grace(reason: str, ts: datetime) -> None:
+            try:
+                await asyncio.sleep(self.service_config.alert_grace_seconds)
+            except asyncio.CancelledError:
+                return
+            if self.feed_manager.feed_source == FeedSource.ALPACA_RELAY:
+                return
+            logger.warning(
+                "Feed still down after %.0fs grace; posting BROKEN alert",
+                self.service_config.alert_grace_seconds,
+            )
+            _post_broken(reason, ts)
+
+        def _on_disconnect(reason: str, ts: datetime) -> None:
+            if self._broken_alert_posted:
+                return  # already announced this outage
+            if self._broken_alert_task and not self._broken_alert_task.done():
+                return  # grace timer already running
+            grace = self.service_config.alert_grace_seconds
+            if grace <= 0:
+                _post_broken(reason, ts)
+                return
+            try:
+                self._broken_alert_task = asyncio.create_task(_broken_after_grace(reason, ts))
+            except RuntimeError:
+                # No running loop (sync test harness): fall back to posting now.
+                _post_broken(reason, ts)
+
         def _on_recover(downtime_s: float, ts: datetime) -> None:
+            if self._broken_alert_task and not self._broken_alert_task.done():
+                self._broken_alert_task.cancel()
+            self._broken_alert_task = None
+            if not self._broken_alert_posted:
+                logger.info("Feed blip of %.1fs recovered inside grace; no Discord alert", downtime_s)
+                return
+            self._broken_alert_posted = False
             if self.discord_notifier and hasattr(self.discord_notifier, "post_recovered_alert"):
                 try:
                     status_info = f"Stream re-established at {ts.isoformat()} · Resuming live data"

@@ -3,7 +3,8 @@
 Virtual $50k paper bot (no broker account). Regime + momentum ETF allocator,
 data from AlpacaRelay, FastAPI dashboard on Railway
 (https://dynamiclongtermstrategybot-production.up.railway.app).
-Deploy: `railway up --detach` from the repo root (CLI deploy, not GitHub-connected).
+Deploy: the Railway service is GitHub-connected (source repo Jhosshua/DynamicLongTermStrategyBot),
+so `git push origin main` redeploys. `railway up --detach` also works as a fallback.
 
 ## Current state (2026-09-14)
 - Live on the real relay feed (SIP, bars only), Railway volume at `/data`.
@@ -45,6 +46,23 @@ the safety gates; restored in b5aff17.
   the 15:50 to 16:00 window re-ran finished cadences.
 - Rejected: raising on skip (logs an error every tick), and catching up after
   the close at the next open (trades a day late, more complexity).
+
+### 2026-09-15: watch day, Discord alert grace period
+- Watched the bot live all day (Tuesday). Monday's 15:50 DAILY_CLOSE ran and
+  produced target weights (QQQ 50 / SPY 20 / XLK 15 / XLE 15) with zero trades.
+  That is by design: DAILY_CLOSE only evaluates; trades happen on the Friday
+  WEEKLY_REBALANCE (or the intraday breaker). First real fills expected Fri 09-18 15:50 ET.
+- Found: Railway's edge cuts the relay websocket every few minutes for EVERY
+  relay client (code 1006, no close frame, relay logs ~225 client drops in 2h
+  across ~9 clients, no 1013 "too slow" evictions). The bot reconnects in ~2.6s.
+  Each blip posted a BROKEN and a RECOVERED Discord card: 345 posts in 24h.
+- Fix: `ServiceConfig.alert_grace_seconds` (90s). BROKEN posts only if the feed
+  is still down after the grace; RECOVERED only follows a posted BROKEN.
+  Tests in tests/unit/test_alert_grace_period.py. Full suite 1317 passing.
+- Rejected: fixing the drops at the relay (root cause is the edge proxy, would
+  need private networking on IPv6 and touches every bot) and lengthening the
+  websocket ping timeout (the client sees no close frame, pings are not the trigger).
+- Not fixed: `reconnect_attempts` in /health keeps counting every blip (cosmetic).
 
 ## Known, not fixed (judgment calls, ask before changing)
 - The drawdown gate uses SPY's drawdown, not the portfolio's, and a manual
