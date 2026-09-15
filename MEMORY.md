@@ -62,6 +62,11 @@ the safety gates; restored in b5aff17.
 - Rejected: fixing the drops at the relay (root cause is the edge proxy, would
   need private networking on IPv6 and touches every bot) and lengthening the
   websocket ping timeout (the client sees no close frame, pings are not the trigger).
+- Second fix (08:55 ET): after the redeploy the dashboard showed regime UNKNOWN
+  and the breaker had no Keltner band, because the last signal/allocation lived
+  only in memory. `start()` now calls `_restore_latest_decision()` which reloads
+  the latest saved signal + allocation (ignored if older than 5 days).
+  Tests in tests/unit/test_restore_latest_decision.py. Suite 1320 passing.
 - Not fixed: `reconnect_attempts` in /health keeps counting every blip (cosmetic).
 
 ## Known, not fixed (judgment calls, ask before changing)

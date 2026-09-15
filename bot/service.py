@@ -933,6 +933,7 @@ class DynamicStrategyService(DecisionDaemon):
 
         # 1. Initialize SQLite schema & paper account ledger
         self.paper_account.init_schema()
+        self._restore_latest_decision()
 
         # 2. Start FeedManager (connects WS / REST, auto-fallback on error)
         await self.feed_manager.start()
@@ -948,6 +949,37 @@ class DynamicStrategyService(DecisionDaemon):
         self._service_state = ServiceState.RUNNING
         logger.info("DynamicStrategyService is fully operational and monitoring NYSE market cadences.")
         await self._stop_event.wait()
+
+    def _restore_latest_decision(self) -> None:
+        """Reload the last saved signal and allocation after a restart.
+
+        Both lived only in memory, so every deploy showed regime UNKNOWN on the
+        dashboard until 15:50 and left the breaker without its Keltner band
+        (only the 3% flash-drop branch worked). Records older than 5 days are
+        ignored: a stale band must not drive a de-risk.
+        """
+        if not self.storage:
+            return
+        try:
+            sig_row = self.storage.signals.get_latest()
+            if sig_row:
+                sig = self.storage.signals.to_model(sig_row)
+                age = datetime.now(timezone.utc) - sig.timestamp.astimezone(timezone.utc)
+                if age <= timedelta(days=5):
+                    self._latest_signal = sig
+                    self._last_eval_time = sig.timestamp
+                    logger.info("Restored last signal from %s (regime %s)", sig.timestamp.isoformat(), sig.regime.value)
+                else:
+                    logger.info("Last saved signal is %.1f days old; not restored", age.total_seconds() / 86400)
+            alloc_row = self.storage.allocations.get_latest()
+            if alloc_row:
+                alloc = self.storage.allocations.to_model(alloc_row)
+                age = datetime.now(timezone.utc) - alloc.timestamp.astimezone(timezone.utc)
+                if age <= timedelta(days=5):
+                    self._latest_allocation = alloc
+                    logger.info("Restored last allocation from %s: %s", alloc.timestamp.isoformat(), alloc.weights)
+        except Exception as e:
+            logger.warning("Could not restore last decision from storage: %s", e)
 
     async def shutdown(self, reason: str = "Shutdown requested") -> None:
         """Graceful shutdown flushes WAL database, disconnects feed, and stops scheduler."""
